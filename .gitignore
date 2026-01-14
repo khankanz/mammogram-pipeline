@@ -1,0 +1,50 @@
+# Data and models (large files, not tracked)
+data/
+models/
+test/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+.eggs/
+*.egg-info/
+*.egg
+
+# Distribution
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# UV
+.uv/
+
+# Logs
+*.log
+
+# Local config
+.env
+.env.local
+
+# Output files
+results.csv
+*.csv
