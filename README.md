@@ -99,19 +99,20 @@ Conservative by design. We'd rather review false positives than miss real ones.
 ## Project Structure
 
 ```
-dicom-search/
+mammogram-pipeline/
 ├── scripts/
 │   ├── 01_preprocess.py      # DICOM → PNG thumbnails
 │   ├── 02_label_server.py    # FastHTML labeling UI
 │   ├── 03_train.py           # fastai training
 │   ├── 04_export.py          # ONNX export
-│   └── 05_inference.py       # Batch classification
+│   ├── 05_inference.py       # Batch classification
+│   ├── 06_gradcam.py         # Model interpretability
+│   └── 07_review.py          # Review predictions
 ├── lib/
 │   ├── config.py             # Paths, constants
 │   ├── db.py                 # SQLite helpers
 │   └── dicom_utils.py        # DICOM normalization
-├── content/                  # Blog/tweet storm drafts
-└── CLAUDE.md                 # AI pair programming context
+└── content/                  # Blog/tweet storm drafts
 ```
 
 ## Why This Exists
