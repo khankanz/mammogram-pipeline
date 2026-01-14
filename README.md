@@ -108,11 +108,10 @@ mammogram-pipeline/
 │   ├── 05_inference.py       # Batch classification
 │   ├── 06_gradcam.py         # Model interpretability
 │   └── 07_review.py          # Review predictions
-├── lib/
-│   ├── config.py             # Paths, constants
-│   ├── db.py                 # SQLite helpers
-│   └── dicom_utils.py        # DICOM normalization
-└── content/                  # Blog/tweet storm drafts
+└── lib/
+    ├── config.py             # Paths, constants
+    ├── db.py                 # SQLite helpers
+    └── dicom_utils.py        # DICOM normalization
 ```
 
 ## Why This Exists
