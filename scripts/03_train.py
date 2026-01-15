@@ -30,7 +30,7 @@ from lib.config import (
     BATCH_SIZE, VALID_PCT, RANDOM_SEED,
     ensure_dirs
 )
-from lib.db import get_db, get_labeled_images
+from lib.db import get_db, get_train_val_split
 
 LABEL_COLS = ['has_biopsy_tool', 'has_mag_view']
 IMAGE_SIZE = 224  # EfficientNet-B0 default
@@ -123,7 +123,8 @@ def train_model(db_path: Path, output_dir: Path, batch_size: int = BATCH_SIZE,
     output_dir.mkdir(parents=True, exist_ok=True)
 
     db = get_db(db_path)
-    labeled = get_labeled_images(db)
+    train_rows, val_rows = get_train_val_split(db)
+    labeled = train_rows + val_rows
 
     if len(labeled) < 10:
         print(f"Error: Need at least 10 labeled images, have {len(labeled)}")
@@ -132,17 +133,24 @@ def train_model(db_path: Path, output_dir: Path, batch_size: int = BATCH_SIZE,
     print(f"Training on {len(labeled)} labeled images")
 
     # Build dataset
-    data = []
-    for row in labeled:
-        thumb_path = Path(row["thumbnail_path"])
-        if thumb_path.exists():
-            data.append({
-                'path': thumb_path,
-                'has_biopsy_tool': float(row['has_biopsy_tool']),
-                'has_mag_view': float(row['has_mag_view']),
-            })
+    def build_dataset(rows):
+        items = []
+        for row in rows:
+            thumb_path = Path(row["thumbnail_path"])
+            if thumb_path.exists():
+                items.append({
+                    'path': thumb_path,
+                    'has_biopsy_tool': float(row['has_biopsy_tool']),
+                    'has_mag_view': float(row['has_mag_view']),
+                })
+            else:
+                print(f"Warning: Missing thumbnail {thumb_path}")
+        return items
 
-    print(f"Found {len(data)} valid thumbnails")
+    train_data = build_dataset(train_rows)
+    valid_data = build_dataset(val_rows)
+
+    print(f"Found {len(train_data)} train and {len(valid_data)} valid thumbnails")
 
     # Class distribution
     biopsy_yes = sum(1 for d in data if d['has_biopsy_tool'] == 1)
@@ -155,13 +163,6 @@ def train_model(db_path: Path, output_dir: Path, batch_size: int = BATCH_SIZE,
     print(f"  Mag View: {mag_yes} ({100*mag_yes/len(data):.1f}%)")
     print(f"  Both: {both_yes} ({100*both_yes/len(data):.1f}%)")
     print(f"  Neither: {neither} ({100*neither/len(data):.1f}%)")
-
-    # Split data
-    np.random.seed(RANDOM_SEED)
-    indices = np.random.permutation(len(data))
-    split_idx = int(len(data) * (1 - VALID_PCT))
-    train_data = [data[i] for i in indices[:split_idx]]
-    valid_data = [data[i] for i in indices[split_idx:]]
 
     print(f"Train: {len(train_data)}, Valid: {len(valid_data)}")
 
@@ -346,7 +347,8 @@ def update_predictions(db_path: Path, model_path: Path, batch_size: int = BATCH_
 
     # Get unlabeled images
     unlabeled = list(db["labels"].rows_where(
-        "has_biopsy_tool IS NULL OR has_mag_view IS NULL"
+        "(has_biopsy_tool IS NULL OR has_mag_view IS NULL) "
+        "AND (split IS NULL OR split IN ('train', 'val'))"
     ))
 
     if not unlabeled:
@@ -365,6 +367,7 @@ def update_predictions(db_path: Path, model_path: Path, batch_size: int = BATCH_
         for row in unlabeled:
             thumb_path = Path(row["thumbnail_path"])
             if not thumb_path.exists():
+                print(f"Warning: Missing thumbnail {thumb_path}")
                 continue
 
             try:
@@ -374,12 +377,15 @@ def update_predictions(db_path: Path, model_path: Path, batch_size: int = BATCH_
                 outputs = model(img_tensor)
                 probs = torch.sigmoid(outputs).cpu().numpy()[0]
 
-                db["labels"].update(row["id"], {
-                    "confidence_biopsy": float(probs[0]),
-                    "confidence_mag": float(probs[1]),
-                    "predicted_at": now,
-                })
-                updated += 1
+                if row.get("split") == "test":
+                    print(f"Warning: Skipping hold-out image id {row['id']}")
+                else:
+                    db["labels"].update(row["id"], {
+                        "confidence_biopsy": float(probs[0]),
+                        "confidence_mag": float(probs[1]),
+                        "predicted_at": now,
+                    })
+                    updated += 1
 
             except Exception as e:
                 print(f"Warning: Failed to predict {thumb_path}: {e}")

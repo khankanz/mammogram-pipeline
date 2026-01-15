@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from fasthtml.common import *
 from lib.config import LABEL_SERVER_PORT, UNDO_STACK_SIZE, DB_PATH, THUMBNAIL_DIR
-from lib.db import get_db, get_stats, get_image_by_id
+from lib.db import get_db, get_stats, get_image_by_id, set_labels
 
 REVIEW_PORT = 5002
 
@@ -69,7 +69,8 @@ def get_review_queue(db, limit=100):
 
     # Get images that have predictions but we want to verify
     rows = list(db["labels"].rows_where(
-        "confidence_biopsy IS NOT NULL AND confidence_mag IS NOT NULL",
+        "confidence_biopsy IS NOT NULL AND confidence_mag IS NOT NULL "
+        "AND (split IS NULL OR split IN ('train', 'val'))",
         order_by="RANDOM()",
         limit=limit
     ))
@@ -289,11 +290,7 @@ def post(id: int):
         biopsy = 1 if (image.get("confidence_biopsy", 0) or 0) >= 0.5 else 0
         mag = 1 if (image.get("confidence_mag", 0) or 0) >= 0.5 else 0
 
-        db["labels"].update(id, {
-            "has_biopsy_tool": biopsy,
-            "has_mag_view": mag,
-            "labeled_at": datetime.now().isoformat()
-        })
+        set_labels(db, id, biopsy, mag)
 
         review_state["confirmations"] += 1
 
@@ -335,11 +332,7 @@ def post(id: int, biopsy: int, mag: int):
             "old_mag": image.get("has_mag_view"),
         })
 
-    db["labels"].update(id, {
-        "has_biopsy_tool": biopsy,
-        "has_mag_view": mag,
-        "labeled_at": datetime.now().isoformat()
-    })
+    set_labels(db, id, biopsy, mag)
 
     review_state["corrections"] += 1
     review_state["current_idx"] += 1

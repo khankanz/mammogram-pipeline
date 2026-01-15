@@ -24,7 +24,10 @@ from lib.config import (
     INFERENCE_BATCH_SIZE, IMAGE_SIZE, ensure_dirs
 )
 from lib.dicom_utils import find_dicoms, dicom_to_pil, get_frame_count
-from lib.db import get_db, insert_image
+from lib.db import get_db, insert_image, get_image_by_id, assign_holdout_splits
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def load_onnx_session(model_path: Path):
@@ -156,17 +159,29 @@ def run_inference(
                     timings["inference"] += time.time() - t0
 
                     t0 = time.time()
+                    pending = []
                     for i, (sid, fname, fidx, tpath) in enumerate(batch_metadata):
                         results[sid].append((float(probs[i, 0]), float(probs[i, 1])))
 
                         # Save to database
                         if tpath:
                             insert_image(db, fname, sid, tpath, fidx)
+                            image_id = db.execute(
+                                "SELECT id FROM labels WHERE filename = ?", [fname]
+                            ).fetchone()[0]
+                            pending.append((image_id, fname, probs[i]))
+
+                    assign_holdout_splits(db)
+                    for image_id, fname, prob in pending:
+                        image = get_image_by_id(db, image_id)
+                        if image and image.get("split") == "test":
+                            logger.warning("Skipping prediction for hold-out image %s", fname)
+                        else:
                             db["labels"].update(
-                                db.execute("SELECT id FROM labels WHERE filename = ?", [fname]).fetchone()[0],
+                                image_id,
                                 {
-                                    "confidence_biopsy": float(probs[i, 0]),
-                                    "confidence_mag": float(probs[i, 1]),
+                                    "confidence_biopsy": float(prob[0]),
+                                    "confidence_mag": float(prob[1]),
                                     "predicted_at": now,
                                 }
                             )
@@ -185,16 +200,28 @@ def run_inference(
         timings["inference"] += time.time() - t0
 
         t0 = time.time()
+        pending = []
         for i, (sid, fname, fidx, tpath) in enumerate(batch_metadata):
             results[sid].append((float(probs[i, 0]), float(probs[i, 1])))
 
             if tpath:
                 insert_image(db, fname, sid, tpath, fidx)
+                image_id = db.execute(
+                    "SELECT id FROM labels WHERE filename = ?", [fname]
+                ).fetchone()[0]
+                pending.append((image_id, fname, probs[i]))
+
+        assign_holdout_splits(db)
+        for image_id, fname, prob in pending:
+            image = get_image_by_id(db, image_id)
+            if image and image.get("split") == "test":
+                logger.warning("Skipping prediction for hold-out image %s", fname)
+            else:
                 db["labels"].update(
-                    db.execute("SELECT id FROM labels WHERE filename = ?", [fname]).fetchone()[0],
+                    image_id,
                     {
-                        "confidence_biopsy": float(probs[i, 0]),
-                        "confidence_mag": float(probs[i, 1]),
+                        "confidence_biopsy": float(prob[0]),
+                        "confidence_mag": float(prob[1]),
                         "predicted_at": now,
                     }
                 )

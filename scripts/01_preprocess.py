@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from joblib import Parallel, delayed
 from tqdm import tqdm
+import logging
 
 # Add parent dir to path for lib imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -17,8 +18,10 @@ from lib.config import (
     DICOM_DIR, THUMBNAIL_DIR, DB_PATH, TEST_DICOM_DIR,
     NUM_WORKERS, PROGRESS_INTERVAL, IMAGE_SIZE, ensure_dirs
 )
-from lib.db import get_db, insert_image, image_exists
+from lib.db import get_db, insert_image, image_exists, assign_holdout_splits
 from lib.dicom_utils import find_dicoms, get_frame_count, create_thumbnail
+
+logger = logging.getLogger(__name__)
 
 
 def process_single_dicom(dicom_path: Path, study_id: str,
@@ -122,9 +125,12 @@ def preprocess_directory(dicom_dir: Path, output_dir: Path, db_path: Path,
                 frame_number=frame["frame_number"],
             )
             inserted += 1
+        else:
+            logger.warning("Skipping duplicate image: %s", frame["filename"])
 
     print(f"Inserted {inserted} new records into database")
     print(f"Total images in database: {db['labels'].count}")
+    assign_holdout_splits(db)
 
     return len(all_frames)
 

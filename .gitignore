@@ -2,6 +2,8 @@
 data/
 models/
 test/
+samp_ds/
+
 
 # Python
 __pycache__/

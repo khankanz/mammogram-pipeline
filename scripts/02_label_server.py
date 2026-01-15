@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from fasthtml.common import *
 from lib.config import LABEL_SERVER_PORT, UNDO_STACK_SIZE, DB_PATH
-from lib.db import get_db, get_stats, get_image_by_id
+from lib.db import get_db, get_stats, get_image_by_id, get_unlabeled, set_labels
 
 # Initialize app
 app, rt = fast_app(
@@ -51,11 +51,7 @@ undo_stack = []
 
 def get_next_image(db):
     """Get next unlabeled image."""
-    rows = list(db["labels"].rows_where(
-        "has_biopsy_tool IS NULL OR has_mag_view IS NULL",
-        order_by="confidence_biopsy ASC NULLS FIRST",
-        limit=1
-    ))
+    rows = get_unlabeled(db, limit=1)
     return rows[0] if rows else None
 
 
@@ -184,11 +180,7 @@ def post(id: int, biopsy: int, mag: int):
         if len(undo_stack) > UNDO_STACK_SIZE:
             undo_stack.pop(0)
 
-    db["labels"].update(id, {
-        "has_biopsy_tool": biopsy,
-        "has_mag_view": mag,
-        "labeled_at": datetime.now().isoformat()
-    })
+    set_labels(db, id, biopsy, mag)
 
     return main_content(db)
 
