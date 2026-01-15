@@ -1,28 +1,20 @@
 """SQLite database helpers using sqlite-utils."""
 
 from sqlite_utils import Database
-from pathlib import Path
 from datetime import datetime
-from typing import Optional
-import hashlib
-import logging
-import random
+import hashlib, logging, random
 from .config import DB_PATH, HOLDOUT_PCT, EXPLORATION_RATE, RANDOM_SEED, VALID_PCT
-
-
-from fastcore.basics import ifnone, store_attr
-from functools import lru_cache
+from fastcore.basics import ifnone
 
 logger = logging.getLogger(__name__)
 
-# Schema definition - all in one place, easy to scan
-_label_schema = dict(
-    id=int, filename=str, study_id=str, thumbnail_path=str, frame_number=int,
-    has_biopsy_tool=int, has_mag_view=int, labeled_at=str,
-    confidence_biopsy=float, confidence_mag=float, predicted_at=str,
-    split=str)
+# Schema: single source of truth
+_schema = dict(id=int, filename=str, study_id=str, thumbnail_path=str, frame_number=int,
+    has_biopsy_tool=int, has_mag_view=int, labeled_at=str, confidence_biopsy=float,
+    confidence_mag=float, predicted_at=str, split=str)
 
-_label_indexes = [(["filename"], {"unique": True}),
+_indexes = [
+    (["filename"], {"unique": True}),
     (["study_id"], {}),
     (["has_biopsy_tool", "has_mag_view"], {}),
     (["confidence_biopsy"], {}),
@@ -30,81 +22,93 @@ _label_indexes = [(["filename"], {"unique": True}),
     (["split"], {}),
 ]
 
-def _init_labels_table(db):
-    "Create labels table with indexes if not exists"
+def _init_db(db):
+    "Create table and indexes if needed"
     if "labels" in db.table_names(): return
-    db["labels"].create(_label_schema, pk="id")
-    for cols,kw in _label_indexes: db["labels"].create_index(cols,**kw)
+    db["labels"].create(_schema, pk="id")
+    for cols, kw in _indexes: db["labels"].create_index(cols, **kw)
 
-def _ensure_labels_schema(db):
-    "Ensure labels table has expected columns and indexes"
-    if "labels" not in db.table_names():
-        return
-    table = db["labels"]
-    if "split" not in table.columns_dict:
-        table.add_column("split", str)
-    for cols, kw in _label_indexes:
-        table.create_index(cols, **kw, if_not_exists=True)
+def _hash_frac(s, seed=RANDOM_SEED):
+    "Deterministic fraction 0-1 from string. Same input = same output."
+    return int(hashlib.sha256(f"{seed}:{s}".encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
 
-def _hash_fraction(value: str, seed: int) -> float:
-    digest = hashlib.sha256(f"{seed}:{value}".encode("utf-8")).hexdigest()
-    return int(digest[:8], 16) / 0xFFFFFFFF
+def _split_for(filename):
+    "Train/val assignment via hash. Prefix ensures different roll than hold-out selection."
+    return "val" if _hash_frac(f"trainval:{filename}") < VALID_PCT else "train"
 
-def _train_val_split(filename: str) -> str:
-    frac = _hash_fraction(f"trainval:{filename}", RANDOM_SEED)
-    return "val" if frac < VALID_PCT else "train"
-
-def assign_holdout_splits(db: Database) -> int:
-    """Assign deterministic hold-out splits for unlabeled, unassigned rows."""
+# Hold-out assignment: bottom HOLDOUT_PCT by hash -> split="test", rest stay NULL
+# This fxn looks at ALL unlabelled, unassigned images and picks 10% for hold-out
+# the end result is that THAT subset of images now haev a 'test' split label assigned to them
+# ALL remainders remain unassigned and have a NULL value for split
+def _assign_holdout(db):
+    "Mark bottom HOLDOUT_PCT of fresh images as test. Deterministic via hash."
     rows = list(db["labels"].rows_where(
-        "split IS NULL AND has_biopsy_tool IS NULL AND has_mag_view IS NULL"
-    ))
-    if not rows:
-        return 0
-    total = len(rows)
-    target = int(round(total * HOLDOUT_PCT))
-    if target <= 0:
-        return 0
-    ranked = sorted(
-        rows,
-        key=lambda r: (_hash_fraction(r["filename"], RANDOM_SEED), r["filename"])
-    )
-    for row in ranked[:target]:
-        db["labels"].update(row["id"], {"split": "test"})
-    logger.info("Assigned hold-out split to %d images", target)
-    return target
+        "split IS NULL AND has_biopsy_tool IS NULL AND has_mag_view IS NULL"))
+    if not rows: return 0
+    
+    n = int(round(len(rows) * HOLDOUT_PCT))
+    if n <= 0: return 0
+    
+    ranked = sorted(rows, key=lambda r: (_hash_frac(r["filename"]), r["filename"]))
+    for r in ranked[:n]: db["labels"].update(r["id"], {"split": "test"})
+    logger.info(f"Assigned {n} images to hold-out")
+    return n
 
-def _backfill_splits(db):
-    "Assign hold-out/test and train/val splits where missing."
-    if "labels" not in db.table_names():
-        return
-    table = db["labels"]
-    assign_holdout_splits(db)
-    updated_trainval = 0
-    for row in table.rows_where(
-        "split IS NULL AND has_biopsy_tool IS NOT NULL AND has_mag_view IS NOT NULL"
-    ):
-        split = _train_val_split(row["filename"])
-        table.update(row["id"], {"split": split})
-        updated_trainval += 1
-    if updated_trainval:
-        logger.info("Assigned train/val split to %d labeled images", updated_trainval)
-
-def _ensure_split_for_image(db: Database, image_id: int) -> None:
+# This function asks wait, is this already part of hold-out? Don't touch. Has it already been assigned to train or val? Don't change
+# IF neither; assign it now, send it to our hashing function; which basically flips a coin val or train?. Why? 
+    # Walk with me: there are two hash functions; 1st hash: hold-out selection; this ranks ALL images by their hash; bottom 10% = hold-out
+    # 2nd hash: train/val split; note that trainval prefix, meaning this file getsa  DIFFERENT has valuefor this decision
+def _ensure_split(db, image_id):
+    "Assign train/val on first label. Hold-out and existing splits untouched."
     row = db["labels"].get(image_id)
-    current_split = row.get("split")
-    if current_split == "test":
-        return
-    if current_split in ("train", "val"):
-        return
-    split = _train_val_split(row["filename"])
-    db["labels"].update(image_id, {"split": split})
+    if row.get("split") in ("test", "train", "val"): return
+    db["labels"].update(image_id, {"split": _split_for(row["filename"])})
+# Before I give you any training data, I want to make sure I didn't give you any hold-out images
+# IF this fires, something's wrong with logic
 
-def _assert_no_holdout(rows: list[dict]) -> None:
-    assert all(r.get("split") != "test" for r in rows), "Hold-out image in training data"
+
+# DAY 1: Preprocess 1000 DICOMs
+#        ┌─────────────────────────────────────────┐
+#        │ All 1000 images: split=NULL, labels=NULL│
+#        └─────────────────────────────────────────┘
+#                           │
+#                           ▼ assign_holdout_splits()
+#        ┌─────────────────────────────────────────┐
+#        │ 100 images: split="test"                │ ← LOCKED FOREVER
+#        │ 900 images: split=NULL                  │ ← Available for labeling
+#        └─────────────────────────────────────────┘
+
+# DAY 2: Label 50 images via UI
+#        ┌─────────────────────────────────────────┐
+#        │ 100 images: split="test" (untouched)    │
+#        │ 50 images: split="train" or "val"       │ ← Just assigned by hash
+#        │ 850 images: split=NULL (still waiting)  │
+#        └─────────────────────────────────────────┘
+
+# DAY 3: Train model, get predictions, label 50 more
+#        ┌─────────────────────────────────────────┐
+#        │ 100 images: split="test" (untouched)    │
+#        │ 100 images: split="train" or "val"      │ ← 50 new ones assigned
+#        │ 800 images: split=NULL (still waiting)  │
+#        └─────────────────────────────────────────┘
+
+# DAY 7: Final state after 500 labels
+#        ┌─────────────────────────────────────────┐
+#        │ 100 images: split="test" (STILL untouched) │
+#        │ 500 images: split="train" (~400) or "val" (~100) │
+#        │ 400 images: split=NULL (never labeled)  │
+#        └─────────────────────────────────────────┘
+
+def _no_holdout(rows):
+    "Safety check: crash if hold-out leaked into training data"
+    assert all(r.get("split") != "test" for r in rows), "Hold-out leak!"
+
+# =============================================================================
+# PUBLIC API
+# =============================================================================
 
 def get_db(path=None):
-    "Get database connection, creating schema if needed"
+    "Get database connection, init schema, assign hold-outs"
     db = Database(str(ifnone(path, DB_PATH)))
     db.execute("PRAGMA journal_mode=WAL")
     # This is a cool design pattern; WAL (Write-Ahead Logging) is a SQLite feature that allows for concurrent reads and writes.
@@ -127,184 +131,142 @@ def get_db(path=None):
 # │  state (UPDATE                                              │
 # │  /DELETE/etc)                                               │
 # └─────────────────────────────────────────────────────────────┘
-    _init_labels_table(db)
-    _ensure_labels_schema(db)
-    _backfill_splits(db)
+    _init_db(db)
+    _assign_holdout(db)
     return db
 
-def insert_image(db: Database, filename: str, study_id: str,
-                 thumbnail_path: str, frame_number: int = 0) -> None:
-    """Insert a new image record (skip if exists)."""
-    if image_exists(db, filename):
-        logger.warning("Duplicate image insert skipped: %s", filename)
-        return
+# image enters the database ; essentially all NULL values
+def insert_image(db, filename, study_id, thumbnail_path, frame_number=0):
+    "Insert new image record. Skips duplicates."
+    if image_exists(db, filename): logger.warning(f"Duplicate skipped: {filename}"); return
     db["labels"].insert({
-        "filename": filename,
-        "study_id": study_id,
-        "thumbnail_path": thumbnail_path,
-        "frame_number": frame_number,
-        "has_biopsy_tool": None,
-        "has_mag_view": None,
-        "labeled_at": None,
-        "confidence_biopsy": None,
-        "confidence_mag": None,
-        "predicted_at": None,
-        "split": None,
+        "filename": filename, "study_id": study_id, "thumbnail_path": thumbnail_path,
+        "frame_number": frame_number, "has_biopsy_tool": None, "has_mag_view": None,
+        "labeled_at": None, "confidence_biopsy": None, "confidence_mag": None,
+        "predicted_at": None, "split": None,
     }, ignore=True)
+    logger.info(f"Inserted {filename}")
+    _assign_holdout(db) # Evaluate new image for hold-out immediately
 
-
-def get_unlabeled(db: Database, limit: int = 1,
-                  exploration_rate: float = EXPLORATION_RATE,
-                  rng: Optional[random.Random] = None) -> list:
-    """Get images needing labels, prioritize low confidence predictions."""
-    # This is the heat of active learning. Order is: 1) images with no predictions yet NULL; brand new images
-    # 2) images where model is uncertain; 0.45, 0.5 etc. #3 images where model is confident; 0.02 and 0.98
-    # In this order, we're attempting to find no predictions exist so those randomly come up, then after training the uncertrain predictions come first
+def get_unlabeled(db, limit=1, exploration_rate=EXPLORATION_RATE, rng=None):
+    "Active learning: balance uncertain, confident, and random samples"
     rng = rng or random
-    where_clause = ("has_biopsy_tool IS NULL AND has_mag_view IS NULL "
-                    "AND (split IS NULL OR split IN ('train', 'val'))")
-    if rng.random() < exploration_rate:
-        rows = list(db["labels"].rows_where(where_clause, order_by="id"))
-        if not rows:
-            return []
-        picked = []
-        for _ in range(min(limit, len(rows))):
-            idx = int(rng.random() * len(rows))
-            picked.append(rows.pop(idx))
-        return picked
-    return list(db["labels"].rows_where(
-        where_clause,
-        order_by="confidence_biopsy ASC NULLS FIRST",
-        limit=limit
-    ))
-
-
-def get_partially_labeled(db: Database, limit: int = 1) -> list:
-    """Get images with only one label set."""
-    return list(db["labels"].rows_where(
-        "(has_biopsy_tool IS NULL) != (has_mag_view IS NULL) "
-        "AND (split IS NULL OR split IN ('train', 'val'))",
-        limit=limit
-    ))
-    # we're trying to be slick with != boolean to say find me instances were we didn't label has_biopsy_tool or has_mag_view; both should have a label associated; either 0 or 1
-    # we might want to consider changing boolean to make it more clear to reader
-
-
-def set_label(db: Database, image_id: int, field: str, value: int) -> None:
-    """Set a label for an image."""
-    if field not in ("biopsy", "mag"):
-        raise ValueError(f"Invalid field: {field}")
-
-    col = "has_biopsy_tool" if field == "biopsy" else "has_mag_view"
-    db["labels"].update(image_id, {
-        col: value,
-        "labeled_at": datetime.now().isoformat(),
-    })
-    _ensure_split_for_image(db, image_id)
-
-def set_labels(db: Database, image_id: int, biopsy: int, mag: int) -> None:
-    """Set both labels for an image, assign split if needed."""
-    db["labels"].update(image_id, {
-        "has_biopsy_tool": biopsy,
-        "has_mag_view": mag,
-        "labeled_at": datetime.now().isoformat(),
-    })
-    _ensure_split_for_image(db, image_id)
-
-
-def clear_label(db: Database, image_id: int, field: str) -> None:
-    """Clear a label (for undo)."""
-    # This is used in our undo feature
-    if field not in ("biopsy", "mag"):
-        raise ValueError(f"Invalid field: {field}")
-
-    col = "has_biopsy_tool" if field == "biopsy" else "has_mag_view"
-    db["labels"].update(image_id, {col: None})
-
-
-def get_labeled_images(db: Database, split: Optional[str] = None) -> list:
-    """Get fully labeled images for training or evaluation."""
-    if split and split not in ("train", "val", "test"):
-        raise ValueError(f"Invalid split: {split}")
-    where = "has_biopsy_tool IS NOT NULL AND has_mag_view IS NOT NULL"
-    if split:
-        where = f"{where} AND split = ?"
-        rows = list(db["labels"].rows_where(where, [split]))
-    else:
-        where = f"{where} AND split IN ('train', 'val')"
+    where = ("has_biopsy_tool IS NULL AND has_mag_view IS NULL "
+        "AND (split IS NULL OR split IN ('train', 'val))")
+    r = rng.random()
+    if r < exploration_rate:
+        # 10% exploration: random
         rows = list(db["labels"].rows_where(where))
-    if split in (None, "train", "val"):
-        _assert_no_holdout(rows)
+        if not rows: return []
+        rng.shuffle(rows)
+        return rows[:limit]
+    elif r < exploration_rate + 0.45:
+        # 45% uncertain: closest to 0.5
+        return list(db["labels"].rows_where(
+            where, order_by="ABS(COALESCE(confidence_biopsy, 0.5) - 0.5) ASC", limit=limit))
+    else:
+        # 45% confident: closest to 0.0 or 1.0
+        return list(db["labels"].rows_where(
+            where, order_by="ABS(COALESCE(confidence_biopsy, 0.5) - 0.5) DESC", limit=limit))
+
+def set_labels(db, image_id, biopsy, mag):
+    "Set both labels, assign split if needed"
+    db["labels"].update(image_id, {"has_biopsy_tool": biopsy, "has_mag_view": mag,
+        "labeled_at": datetime.now().isoformat(),})
+    _ensure_split(db, image_id)
+
+def get_labeled(db, split=None):
+    "Get fully labeled images. Default: train+val only."
+    if split and split not in ("train", "val", "test"): raise ValueError(f"Invalid split: {split}")
+
+    base = "has_biopsy_tool IS NOT NULL AND has_mag_view IS NOT NULL"
+    if split: rows = list(db["label"].rows_where(f"{base} AND split = ?", [split]))
+    else:     rows = list(db["labels"].rows_where(f"{base} AND split IN ('train', 'val')"))
+
+    if split != "test": _no_holdout(rows)
     return rows
 
-def get_train_val_split(db: Database) -> tuple[list, list]:
-    """Return labeled train and val splits."""
-    train_rows = get_labeled_images(db, split="train")
-    val_rows = get_labeled_images(db, split="val")
-    _assert_no_holdout(train_rows + val_rows)
-    return train_rows, val_rows
-    # this is our Training Data Query; only return images where both labels are set; training needs complete data
+def get_train_val(db):
+    "Return (train_rows, val_rows) for training"
+    train, val = get_labeled(db, "train"), get_labeled(db, "val")
+    _no_holdout(train + val)
+    return train, val
 
-def update_predictions(db: Database, predictions: list[dict]) -> None:
-    """Bulk update prediction confidences."""
+def update_predictions(db, preds):
+    "Bulk update confidences for unlabeled images. Skips hold-out and already-labeled."
     now = datetime.now().isoformat()
-    for pred in predictions:
-        row = get_image_by_id(db, pred["id"])
-        if not row:
-            logger.warning("Prediction skipped; missing image id %s", pred.get("id"))
-            continue
-        if row.get("split") == "test":
-            logger.warning("Prediction skipped for hold-out image id %s", pred.get("id"))
-            continue
-        db["labels"].update(pred["id"], {
-            "confidence_biopsy": pred.get("confidence_biopsy"),
-            "confidence_mag": pred.get("confidence_mag"),
+    for p in preds:
+        row = get_image_by_id(db, p["id"])
+        if not row: continue
+        if row.get("split") == "test": continue
+        # Only update if unlabeled - skip train/val
+        if row.get("has_biopsy_tool") is not None: continue
+        db["labels"].update(p["id"], {
+            "confidence_biopsy": p.get("confidence_biopsy"),
+            "confidence_mag": p.get("confidence_mag"),
             "predicted_at": now,
         })
+    logger.info(f"Updated {len(preds)} predictions")
 
-
-def get_stats(db: Database) -> dict:
-    """Get labeling statistics."""
-    total = db["labels"].count
-
-    biopsy_labeled = db.execute(
-        "SELECT COUNT(*) FROM labels WHERE has_biopsy_tool IS NOT NULL"
-    ).fetchone()[0]
-    biopsy_yes = db.execute(
-        "SELECT COUNT(*) FROM labels WHERE has_biopsy_tool = 1"
-    ).fetchone()[0]
-
-    mag_labeled = db.execute(
-        "SELECT COUNT(*) FROM labels WHERE has_mag_view IS NOT NULL"
-    ).fetchone()[0]
-    mag_yes = db.execute(
-        "SELECT COUNT(*) FROM labels WHERE has_mag_view = 1"
-    ).fetchone()[0]
-
-    fully_labeled = db.execute(
-        "SELECT COUNT(*) FROM labels WHERE has_biopsy_tool IS NOT NULL AND has_mag_view IS NOT NULL"
-    ).fetchone()[0]
-
+def get_stats(db):
+    "Labeling statistics"
+    q = lambda sql: db.execute(sql).fetchone()[0]
     return {
-        "total": total,
-        "biopsy_labeled": biopsy_labeled,
-        "biopsy_yes": biopsy_yes,
-        "mag_labeled": mag_labeled,
-        "mag_yes": mag_yes,
-        "fully_labeled": fully_labeled,
+        "total": db["labels"].count,
+        "biopsy_labeled": q("SELECT COUNT(*) FROM labels WHERE has_biopsy_tool IS NOT NULL"),
+        "biopsy_yes":     q("SELECT COUNT(*) FROM labels WHERE has_biopsy_tool = 1"),
+        "mag_labeled":    q("SELECT COUNT(*) FROM labels WHERE has_mag_view IS NOT NULL"),
+        "mag_yes":        q("SELECT COUNT(*) FROM labels WHERE has_mag_view = 1"),
+        "fully_labeled":  q("SELECT COUNT(*) FROM labels WHERE has_biopsy_tool IS NOT NULL AND has_mag_view IS NOT NULL"),
     }
 
+def get_image_by_id(db, image_id):
+    try: return db["labels"].get(image_id)
+    except: return None
 
-def get_image_by_id(db: Database, image_id: int) -> Optional[dict]:
-    """Get a single image by ID."""
-    try:
-        return db["labels"].get(image_id)
-    except Exception:
-        return None
+def image_exists(db, filename): return db.execute("SELECT 1 FROM labels wHERE filename = ? LIMIT 1", [filename]).fetchone() is not None
 
+# IMPORTANT: Predictions are run on **unlabeled** images, not on va/train
+# ┌─────────────────────────────────────────────────────────────────┐
+# │ ITERATION 1                                                      │
+# ├─────────────────────────────────────────────────────────────────┤
+# │                                                                  │
+# │  1000 images total                                               │
+# │  ├── 100 hold-out (split="test", untouched forever)             │
+# │  └── 900 available (split=NULL, unlabeled)                       │
+# │                                                                  │
+# │  You label 50 random images                                      │
+# │  ├── ~40 become split="train"                                    │
+# │  └── ~10 become split="val"                                      │
+# │                                                                  │
+# │  Train model on 40 train images                                  │
+# │  Validate on 10 val images → 67% accuracy                        │
+# │                                                                  │
+# │  Run predictions on 850 UNLABELED images ← THIS IS KEY           │
+# │  Each gets confidence_biopsy, confidence_mag scores              │
+# │                                                                  │
+# └─────────────────────────────────────────────────────────────────┘
 
-def image_exists(db: Database, filename: str) -> bool:
-    """Check if an image already exists in database."""
-    return db.execute(
-        "SELECT 1 FROM labels WHERE filename = ? LIMIT 1", [filename]
-    ).fetchone() is not None
+# ┌─────────────────────────────────────────────────────────────────┐
+# │ ITERATION 2                                                      │
+# ├─────────────────────────────────────────────────────────────────┤
+# │                                                                  │
+# │  get_unlabeled() looks at 850 unlabeled images                   │
+# │  Returns images where model is:                                  │
+# │  ├── 10% random (exploration)                                    │
+# │  ├── 45% uncertain (confidence ≈ 0.5)                            │
+# │  └── 45% confident (confidence ≈ 0.0 or ≈ 1.0) ← CATCHES ERRORS │
+# │                                                                  │
+# │  You label 50 more images                                        │
+# │  These 50 get assigned to train/val via hash                     │
+# │                                                                  │
+# │  Now you have:                                                   │
+# │  ├── 100 labeled (80 train, 20 val)                              │
+# │  └── 800 unlabeled (with predictions)                            │
+# │                                                                  │
+# │  Train model on 80 train images                                  │
+# │  Validate on 20 val images → 78% accuracy                        │
+# │                                                                  │
+# │  Run predictions on 800 UNLABELED images                         │
+# │                                                                  │
+# └─────────────────────────────────────────────────────────────────┘

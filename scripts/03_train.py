@@ -30,7 +30,7 @@ from lib.config import (
     BATCH_SIZE, VALID_PCT, RANDOM_SEED,
     ensure_dirs
 )
-from lib.db import get_db, get_train_val_split
+from lib.db import get_db, get_train_val_split, get_labeled_images
 
 LABEL_COLS = ['has_biopsy_tool', 'has_mag_view']
 IMAGE_SIZE = 224  # EfficientNet-B0 default
@@ -393,15 +393,90 @@ def update_predictions(db_path: Path, model_path: Path, batch_size: int = BATCH_
     print(f"Updated predictions for {updated} images")
 
 
+def evaluate_holdout(db_path: Path, model_path: Path, batch_size: int = BATCH_SIZE) -> dict:
+    """Final evaluation on pristine hold-out set. Run ONCE at the end."""
+    db = get_db(db_path)
+    holdout_rows = get_labeled_images(db, split="test")
+    if not holdout_rows:
+        raise ValueError("No labeled hold-out images!")
+
+    # Build dataset (no augmentation)
+    items = []
+    for row in holdout_rows:
+        thumb_path = Path(row["thumbnail_path"])
+        if thumb_path.exists():
+            items.append({
+                "path": thumb_path,
+                "has_biopsy_tool": float(row["has_biopsy_tool"]),
+                "has_mag_view": float(row["has_mag_view"]),
+            })
+        else:
+            print(f"Warning: Missing thumbnail {thumb_path}")
+
+    if not items:
+        raise ValueError("No hold-out thumbnails found on disk.")
+
+    holdout_ds = MultiLabelDataset(items, augment=False)
+    holdout_dl = DataLoader(holdout_ds, batch_size=batch_size, shuffle=False, num_workers=4)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    checkpoint = torch.load(model_path, map_location=device)
+    model = create_model(num_classes=2)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model = model.to(device)
+    model.eval()
+
+    all_preds, all_targets = [], []
+    with torch.no_grad():
+        for images, labels in holdout_dl:
+            images = images.to(device)
+            outputs = model(images)
+            preds = torch.sigmoid(outputs)
+            all_preds.append(preds.cpu())
+            all_targets.append(labels)
+
+    preds = torch.cat(all_preds).numpy()
+    targets = torch.cat(all_targets).numpy()
+    preds_binary = (preds > 0.5).astype(int)
+
+    print("\n=== Hold-out Evaluation (Test Split) ===")
+    print(f"Images evaluated: {len(items)}")
+    print("\nBiopsy Tool:")
+    print(classification_report(targets[:, 0], preds_binary[:, 0],
+                                target_names=["No", "Yes"], zero_division=0))
+    print("Mag View:")
+    print(classification_report(targets[:, 1], preds_binary[:, 1],
+                                target_names=["No", "Yes"], zero_division=0))
+
+    biopsy_acc = (preds_binary[:, 0] == targets[:, 0]).mean().item()
+    mag_acc = (preds_binary[:, 1] == targets[:, 1]).mean().item()
+    avg_acc = (biopsy_acc + mag_acc) / 2
+    print(f"Hold-out accuracy: biopsy={biopsy_acc:.4f}, mag={mag_acc:.4f}, avg={avg_acc:.4f}")
+
+    return {
+        "biopsy_acc": biopsy_acc,
+        "mag_acc": mag_acc,
+        "avg_acc": avg_acc,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train multi-label DICOM classifier")
     parser.add_argument("--db", type=Path, default=DB_PATH)
     parser.add_argument("--output-dir", type=Path, default=MODEL_DIR)
+    parser.add_argument("--model", type=Path, default=MODEL_DIR / "model.pth",
+                        help="Trained model path for hold-out evaluation")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--no-predict", action="store_true")
+    parser.add_argument("--evaluate-holdout", action="store_true",
+                        help="Evaluate on labeled hold-out set and exit")
 
     args = parser.parse_args()
+
+    if args.evaluate_holdout:
+        evaluate_holdout(args.db, args.model, args.batch_size)
+        return
 
     model_path = train_model(
         db_path=args.db,
