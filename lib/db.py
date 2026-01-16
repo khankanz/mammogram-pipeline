@@ -152,7 +152,7 @@ def get_unlabeled(db, limit=1, exploration_rate=EXPLORATION_RATE, rng=None):
     "Active learning: balance uncertain, confident, and random samples"
     rng = rng or random
     where = ("has_biopsy_tool IS NULL AND has_mag_view IS NULL "
-        "AND (split IS NULL OR split IN ('train', 'val))")
+        "AND (split IS NULL OR split IN ('train', 'val'))")
     r = rng.random()
     if r < exploration_rate:
         # 10% exploration: random
