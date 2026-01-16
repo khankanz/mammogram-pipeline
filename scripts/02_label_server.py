@@ -68,7 +68,7 @@ document.addEventListener('keydown', function(e) {
 
     if (key == 'u') {
         url = '/undo';
-    } else if (imageId) {
+    } else if (imageId && imageId !== 'None' && imageId !== '') {
         // These routes require an image ID
         const routes = {
             '1': `/label?id=${imageId}&biopsy=1&mag=0`,
@@ -154,15 +154,19 @@ def label_buttons(image_id):
         cls="buttons"
     )
 
-def main_content(db):
+def main_content(db, override_image=None):
     """Main UI content - stats, image, buttons.
     
     The data_image_id attribute is read by keyboard handler JS.
     This is how we pass dynamic data to a single global listener.
+
+    Now accepts an override_image param.
     """
-    image = get_next_image(db)
+    image = override_image if override_image else get_next_image(db)
     image_id = image["id"] if image else None
     filename = image["filename"].split("/")[-1][:40] if image else ""
+
+    data_id = str(image_id) if image_id else "" # convert None to empty string for JS compatibility; without this image_id is None, Python renders "None" the string, then JS would try to POST /label?id=None&biopsy= which is like boom
 
     return Div(
         stats_bar(db),
@@ -232,6 +236,9 @@ def undo_last():
             "has_mag_view": undo["old_mag"],
             "labeled_at": None
         })
+        # Return the image we just undid!
+        undone_image = get_image_by_id(db, undo["id"])
+        return main_content(db, override_image=undone_image)
     return main_content(db)
 
 @app.get("/stats")
