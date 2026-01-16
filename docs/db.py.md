@@ -33,9 +33,9 @@ _indexes = [
 
 ## The Split Strategy: Two Hashes, Two Decisions
 
-Here's where it gets interesting. We need deterministic, reproducible splits—but we also need to make *two independent decisions* per image:
+We need deterministic, reproducible splits—but we also need to make *two independent decisions* per image:
 
-1. **Is this image hold-out?** (test set, locked forever)
+1. **Is this image hold-out?** (test set, locked forever) — decided at insert time
 2. **If not hold-out, is it train or val?** (assigned when first labeled)
 
 One hash won't cut it. If we used the same hash for both decisions, the bottom 10% by hash would be hold-out AND would have a bias toward one split. We need independence.
@@ -52,34 +52,67 @@ def _split_for(filename):
 
 The `trainval:` prefix is the key. Same filename, different hash input, independent decision. `image_001.dcm` might hash to 0.08 for hold-out selection (bottom 10% → test) but hash to 0.73 for train/val (→ train). Different rolls, same determinism.
 
----
+### Why SHA256 Gives Uniform Distribution
 
-## Hold-out Assignment: Lock It Early
-
-The hold-out set is sacred. Once assigned, it never changes. We assign it *before* any labeling happens:
+The hash function does something clever:
 
 ```python
-def _assign_holdout(db):
-    "Mark bottom HOLDOUT_PCT of fresh images as test. Deterministic via hash."
-    rows = list(db["labels"].rows_where(
-        "split IS NULL AND has_biopsy_tool IS NULL AND has_mag_view IS NULL"))
-    if not rows: return 0
-    
-    n = int(round(len(rows) * HOLDOUT_PCT))
-    if n <= 0: return 0
-    
-    ranked = sorted(rows, key=lambda r: (_hash_frac(r["filename"]), r["filename"]))
-    for r in ranked[:n]: db["labels"].update(r["id"], {"split": "test"})
-    return n
+# _hash_frac combines seed with filename
+# SHA256 produces a 64-char hex string like 'a2f23...'
+# Take first 8 hex chars, convert to int, divide by max 8-hex-digit value
 ```
 
-This looks at all unlabeled, unassigned images, ranks them by hash, and marks the bottom 10% as `test`. Everyone else stays `split=NULL`—available for labeling but not yet assigned to train/val.
+SHA256 is designed to output evenly across all possible values—no input pattern produces clustered outputs. When we divide by max value, we get numbers spread evenly between 0 and 1. It's a uniform distribution. SHA256 *looks* random (uniform spread) but it's completely reproducible. Same input, same output. You get statistical properties of randomness without actual randomness.
+
+---
+
+## Hold-out Assignment: At Insert Time
+
+The refactored version assigns hold-out status immediately when an image is inserted—no separate batch assignment step:
+
+```python
+def insert_image(db, filename, study_id, thumbnail_path, frame_number=0):
+    "Insert new image record. Skips duplicates."
+    if image_exists(db, filename): 
+        logger.warning(f"Duplicate skipped: {filename}")
+        return
+
+    # Holdout decision is per-image, based on hash
+    split = "test" if _hash_frac(filename) < HOLDOUT_PCT else None
+
+    db["labels"].insert({
+        "filename": filename, "study_id": study_id, "thumbnail_path": thumbnail_path,
+        "frame_number": frame_number, "has_biopsy_tool": None, "has_mag_view": None,
+        "labeled_at": None, "confidence_biopsy": None, "confidence_mag": None,
+        "predicted_at": None, "split": split,
+    }, ignore=True)
+```
+
+Each image gets its fate decided on arrival. Bottom 10% by hash → `split="test"`. Everyone else → `split=NULL` (available for labeling, train/val decided later).
+
+---
+
+## Train/Val Assignment: Lazy, On First Label
+
+The train/val split happens when you actually label an image—not before:
+
+```python
+def _ensure_split(db, image_id):
+    "Assign train/val on first label. Hold-out and existing splits untouched."
+    row = db["labels"].get(image_id)
+    if row.get("split") in ("test", "train", "val"): return
+    db["labels"].update(image_id, {"split": _split_for(row["filename"])})
+```
+
+Two hash decisions happen at different times:
+- **1st hash (at `insert_image`)**: hold-out selection — if hash < HOLDOUT_PCT → "test"
+- **2nd hash (at `_ensure_split`)**: train/val split — uses "trainval:" prefix for independent coin flip
+
+Both are deterministic per filename, but the prefixes ensure different outcomes.
 
 ---
 
 ## The Lifecycle: From Ingestion to Training
-
-Here's how an image flows through the system:
 
 ```
 DAY 1: Preprocess 1000 DICOMs
@@ -87,7 +120,7 @@ DAY 1: Preprocess 1000 DICOMs
        │ All 1000 images: split=NULL, labels=NULL│
        └─────────────────────────────────────────┘
                           │
-                          ▼ _assign_holdout()
+                          ▼ insert_image() with hash check
        ┌─────────────────────────────────────────┐
        │ 100 images: split="test"                │ ← LOCKED FOREVER
        │ 900 images: split=NULL                  │ ← Available for labeling
@@ -107,18 +140,6 @@ DAY 7: Final state after 500 labels
        │ 400 images: split=NULL (never labeled)  │
        └─────────────────────────────────────────┘
 ```
-
-The train/val assignment happens lazily—only when you actually label an image:
-
-```python
-def _ensure_split(db, image_id):
-    "Assign train/val on first label. Hold-out and existing splits untouched."
-    row = db["labels"].get(image_id)
-    if row.get("split") in ("test", "train", "val"): return
-    db["labels"].update(image_id, {"split": _split_for(row["filename"])})
-```
-
-Already hold-out? Don't touch. Already assigned? Don't change. Otherwise, flip the (deterministic) coin.
 
 ---
 
@@ -144,7 +165,8 @@ SQLite's default journaling blocks readers during writes. WAL (Write-Ahead Loggi
 def get_db(path=None):
     db = Database(str(ifnone(path, DB_PATH)))
     db.execute("PRAGMA journal_mode=WAL")
-    # ...
+    _init_db(db)
+    return db
 ```
 
 How it works:
@@ -160,8 +182,11 @@ How it works:
 │     ┌─────┴─────┐                                           │
 │    YES          NO                                          │
 │     ↓            ↓                                          │
-│  Read latest   Read from                                    │
-│  from WAL      main .db                                     │
+│  Find latest   Read from                                    │
+│  TX for row 5  main .db                                     │
+│     ↓                                                       │
+│  Return that                                                │
+│  state                                                      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -178,22 +203,28 @@ def get_unlabeled(db, limit=1, exploration_rate=EXPLORATION_RATE, rng=None):
     r = rng.random()
     if r < exploration_rate:
         # 10% exploration: random
-        # ...
+        rows = list(db["labels"].rows_where(where))
+        rng.shuffle(rows)
+        return rows[:limit]
     elif r < exploration_rate + 0.45:
         # 45% uncertain: closest to 0.5
         return list(db["labels"].rows_where(
-            where, order_by="ABS(COALESCE(confidence_biopsy, 0.5) - 0.5) ASC", limit=limit))
+            where, order_by="ABS(COALESCE(confidence_biopsy, 0.5) - 0.5) ASC, RANDOM()", limit=limit))
     else:
         # 45% confident: closest to 0.0 or 1.0
         return list(db["labels"].rows_where(
-            where, order_by="ABS(COALESCE(confidence_biopsy, 0.5) - 0.5) DESC", limit=limit))
+            where, order_by="ABS(COALESCE(confidence_biopsy, 0.5) - 0.5) DESC, RANDOM()", limit=limit))
 ```
 
 - **10% random**: Exploration. Prevents the model from getting stuck in local optima.
 - **45% uncertain**: Confidence near 0.5. The model is confused—your label has maximum information value.
 - **45% confident**: Confidence near 0 or 1. The model is sure—but *wrong* confident predictions are gold. This catches systematic errors.
 
-The iteration loop looks like:
+Note the `RANDOM()` tiebreaker in the ORDER BY—when multiple images have the same confidence, we don't want to always return the same one.
+
+---
+
+## The Active Learning Loop
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -205,7 +236,7 @@ The iteration loop looks like:
 │                                                                  │
 │  Label 50 random images → ~40 train, ~10 val                     │
 │  Train model, validate → 67% accuracy                            │
-│  Run predictions on 850 UNLABELED images                         │
+│  Run predictions on 850 UNLABELED images ← THIS IS KEY           │
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
@@ -230,19 +261,19 @@ Key insight: predictions run on *unlabeled* images only. Train and val sets get 
 
 **Database setup:**
 ```python
-db = get_db()  # Init schema, assign hold-outs, enable WAL
+db = get_db()  # Init schema, enable WAL
 ```
 
 **Image ingestion:**
 ```python
 insert_image(db, filename, study_id, thumbnail_path, frame_number=0)
-# Skips duplicates, immediately evaluates for hold-out
+# Skips duplicates, immediately assigns hold-out if hash < HOLDOUT_PCT
 ```
 
 **Labeling workflow:**
 ```python
 rows = get_unlabeled(db, limit=10)  # Active learning selection
-set_labels(db, image_id, biopsy=1, mag=0)  # Assigns split on first label
+set_labels(db, image_id, biopsy=1, mag=0)  # Assigns train/val split on first label
 ```
 
 **Training:**
@@ -263,4 +294,4 @@ get_stats(db)  # Counts for dashboard
 
 ---
 
-That's the database layer. Deterministic splits, active learning sampling, and safety rails that crash loudly if you mess up. The hold-out stays pure, the training loop stays informed.
+That's the database layer. Deterministic splits decided at two different times (insert and first label), active learning sampling, and safety rails that crash loudly if you mess up. The hold-out stays pure, the training loop stays informed.
