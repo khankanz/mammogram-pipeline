@@ -122,6 +122,14 @@ def insert_image(db, filename, study_id, thumbnail_path, frame_number=0):
     if image_exists(db, filename): logger.warning(f"Duplicate skipped: {filename}"); return
 
     # Holdout decision is per-image, based on hash
+    # Let's expand on this further: _hash_frac combines seed 42 with filename, 
+    # converts string to bytes using SHA256, produced a 64-char hex string like 'a2f23...' 
+    # takes the first 8 hex chars, converts hex to int, divides by max 8-hex-digit. 
+    # WHY uniform 0-1? SHA256 is designed to output evenly across all possible values. 
+    # no input pattern produce clustered outputs. so when we divide by max value, 
+    # we get numbers spread evenly between 0 and 1. it is a uniform distribution. 
+    # SHA256 looks random (uniform spread) but it's completely reproducible. 
+    # Same inp, same outs. you get statistical properties of randomness without actual randomness.
     split = "test" if _hash_frac(filename) < HOLDOUT_PCT else None
 
     db["labels"].insert({
@@ -137,6 +145,11 @@ def get_unlabeled(db, limit=1, exploration_rate=EXPLORATION_RATE, rng=None):
     rng = rng or random
     where = ("has_biopsy_tool IS NULL AND has_mag_view IS NULL "
         "AND (split IS NULL OR split IN ('train', 'val'))")
+    
+    # DEBUG
+    count = db.execute(f"SELECT COUNT(*) FROM labels WHERE {where}").fetchone()[0]
+    print(f"DEBUG get_unlabeled: {count} candidates")
+    
     r = rng.random()
     if r < exploration_rate:
         # 10% exploration: random
@@ -147,11 +160,11 @@ def get_unlabeled(db, limit=1, exploration_rate=EXPLORATION_RATE, rng=None):
     elif r < exploration_rate + 0.45:
         # 45% uncertain: closest to 0.5
         return list(db["labels"].rows_where(
-            where, order_by="ABS(COALESCE(confidence_biopsy, 0.5) - 0.5) ASC", limit=limit))
+            where, order_by="ABS(COALESCE(confidence_biopsy, 0.5) - 0.5) ASC, RANDOM()", limit=limit))
     else:
         # 45% confident: closest to 0.0 or 1.0
         return list(db["labels"].rows_where(
-            where, order_by="ABS(COALESCE(confidence_biopsy, 0.5) - 0.5) DESC", limit=limit))
+            where, order_by="ABS(COALESCE(confidence_biopsy, 0.5) - 0.5) DESC, RANDOM()", limit=limit))
 
 def set_labels(db, image_id, biopsy, mag):
     "Set both labels, assign split if needed"

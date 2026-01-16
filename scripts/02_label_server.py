@@ -59,8 +59,10 @@ document.addEventListener('keydown', function(e) {
     if (e.target.tagName === 'INPUT') return;
 
     // Read current image ID from data attribute on #main
-    const mainEl = document.getElementById('main');
-    const imageId = mainEl?.dataset?.imageId; // oh how Iv'e missed the ? notation in JavaScript. This is Optional Chaining. mainEl might be null which means if we try to get dataset attr, it goes boom. In JS we can chain and the moment it hits null or undefined, it stops and returns undefined. Python doesn't have an equivalent. The same thing would be; IF mainEl and dataset is not None then grab it or use getattr with default None values OR a try/catch block then there's also dict.get() which I've unfortunately used too much of, nothing wrong with it just reads ugly.
+    const mainEl = document.getElementById('main-inner');
+    const imageId = mainEl?.dataset?.imageId; 
+    
+    // oh how Iv'e missed the ? notation in JavaScript. This is Optional Chaining. mainEl might be null which means if we try to get dataset attr, it goes boom. In JS we can chain and the moment it hits null or undefined, it stops and returns undefined. Python doesn't have an equivalent. The same thing would be; IF mainEl and dataset is not None then grab it or use getattr with default None values OR a try/catch block then there's also dict.get() which I've unfortunately used too much of, nothing wrong with it just reads ugly.
 
     // Build route map - undo doesn't need imageId
     let url = null;
@@ -173,7 +175,7 @@ def main_content(db, override_image=None):
         image_display(image),
         Div(filename, cls="filename") if image else "",
         label_buttons(image_id),
-        id="main",
+        id="main-inner",
         data_image_id=image_id, # JS reads this via mainEl.dataset.imageId
     )
 
@@ -185,7 +187,7 @@ def main_content(db, override_image=None):
 def homepage():
     """Main page - FastHTML auto-wraps in HTML with headers."""
     db = get_db(DB_PATH)
-    return Title("FastHTML Labeler"), Div(main_content(db), cls="container")
+    return Title("FastHTML Labeler"), Div(Div(main_content(db), id="main"), cls="container")
 
 # This method is fetching the image from the database path so we can populate the labeling interface
 @app.get("/image/{image_id}")
@@ -218,9 +220,13 @@ def save_label(id:int, biopsy:int, mag:int):
 # Why? This is a sentient value hack; 
 @app.post("/skip")
 def skip_image(id:int):
-    """Skip image - just move on, leave it in the unlabeled pool."""
+    """Skip image - just move on without labeling, but allow undo"""
+    global undo_stack
     db = get_db(DB_PATH)
-    # Don't touch anything - it stays unlabeled, will come back naturally
+    
+    # Save to undo stack so we can return to this image
+    undo_stack.append({"id": id, "action": "skip"}) # Mark as skip, not a label change 
+    if len(undo_stack) > UNDO_STACK_SIZE: undo_stack.pop(0)
     return main_content(db)
 
 @app.post("/undo")
@@ -231,14 +237,20 @@ def undo_last():
 
     if undo_stack:
         undo = undo_stack.pop()
-        db["labels"].update(undo["id"], {
-            "has_biopsy_tool": undo["old_biopsy"],
-            "has_mag_view": undo["old_mag"],
-            "labeled_at": None
-        })
-        # Return the image we just undid!
-        undone_image = get_image_by_id(db, undo["id"])
-        return main_content(db, override_image=undone_image)
+        if undo.get("action") == "skip":
+            # For skip, just return that image
+            image = get_image_by_id(db, undo["id"])
+            return main_content(db, override_image=image)
+        else:
+            db["labels"].update(undo["id"], {
+                "has_biopsy_tool": undo["old_biopsy"],
+                "has_mag_view": undo["old_mag"],
+                "labeled_at": None
+            })
+            # Return the image we just undid!
+            undone_image = get_image_by_id(db, undo["id"])
+            return main_content(db, override_image=undone_image)
+            
     return main_content(db)
 
 @app.get("/stats")
