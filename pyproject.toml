@@ -19,6 +19,8 @@ dependencies = [
     "tqdm>=4.66",
     "ipython>=8.0",
     "seaborn>=0.13.2",
+    "pylibjpeg>=2.1.0",
+    "pylibjpeg-libjpeg>=2.3.0",
 ]
 
 [dependency-groups]

@@ -1,184 +1,170 @@
 #!/usr/bin/env python3
-"""Preprocess DICOMs: convert to normalized 224x224 PNGs and populate database.
+"""Preprocess DICOMs: convert to normalized thumbnails and populate database."""
 
-Processes all frames from multi-frame DICOMs.
-"""
-
-import argparse
-import sys
+import sys, time, logging
 from pathlib import Path
-from joblib import Parallel, delayed
-from tqdm import tqdm
-import logging
 
-# Add parent dir to path for lib imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from lib.config import (
-    DICOM_DIR, THUMBNAIL_DIR, DB_PATH, TEST_DICOM_DIR,
-    NUM_WORKERS, PROGRESS_INTERVAL, IMAGE_SIZE, ensure_dirs
-)
-from lib.db import get_db, insert_image, image_exists, assign_holdout_splits
+from fastcore.all import *
+from fastcore.script import call_parse
+from fastprogress.fastprogress import progress_bar
+
+import pydicom
+from lib.config import (DICOM_DIR, THUMBNAIL_DIR, DB_PATH, TEST_DICOM_DIR,
+                        NUM_WORKERS, IMAGE_SIZE, ensure_dirs)
+from lib.db import get_db, insert_image, image_exists
 from lib.dicom_utils import find_dicoms, get_frame_count, create_thumbnail
+import warnings
 
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# TIMING UTILITIES
+# =============================================================================
 
-def process_single_dicom(dicom_path: Path, study_id: str,
-                         output_dir: Path, db_path: Path) -> list[dict]:
-    """Process a single DICOM file, handling multi-frame.
+class Timer:
+    "Simple timer that tracks elapsed time and throughput."
+    def __init__(self, name=''):
+        self.name, self.start, self.n = name, time.perf_counter(), 0
+    
+    def __repr__(self):
+        elapsed = time.perf_counter() - self.start
+        rate = self.n / elapsed if elapsed > 0 else 0
+        return f"{self.name}: {self.n:,} items in {elapsed:.1f}s ({rate:.1f}/sec)"
+    
+    def add(self, n=1): self.n += n; return self
 
-    Returns list of successfully processed frames as dicts.
-    """
-    results = []
+# =============================================================================
+# CORE PROCESSING
+# =============================================================================
 
+def _frame_filename(study_id, stem, frame_idx, num_frames):
+    "Generate unique filenames for a frame."
+    base = f"{study_id}/{stem}"
+    return f"{base}_frame{frame_idx:04d}" if num_frames > 1 else base
+
+def _process_frame(dcm_path, study_id, frame_idx, num_frames, out_dir):
+    "Process a single frame, return dict or None"
+    filename = _frame_filename(study_id, dcm_path.stem, frame_idx, num_frames)
+    thumb_name = filename.replace("/","_") + ".png"
+    thumb_path = out_dir / thumb_name
+
+    # Idempotent: skip if exists
+    if thumb_path.exists(): return dict(filename=filename, study_id=study_id, thumbnail_path=str(thumb_path))
+    # Create thumbnail
+    if create_thumbnail(dcm_path, thumb_path, frame_idx, IMAGE_SIZE): return dict(filename=filename, study_id=study_id, 
+        thumbnail_path=str(thumb_path), frame_number=frame_idx)
+    return None
+
+def process_dicom(dcm_path, study_id,out_dir):
+    "Process a single DICOM file, return list of frame dicts"
     try:
-        import pydicom
-        ds = pydicom.dcmread(str(dicom_path), stop_before_pixels=False)
+        ds = pydicom.dcmread(str(dcm_path), stop_before_pixels=False) # Why? Because we need the pixel data to generate thumbnails
         num_frames = get_frame_count(ds)
     except Exception as e:
-        print(f"Warning: Cannot read {dicom_path}: {e}")
-        return results
-
-    for frame_idx in range(num_frames):
-        # Generate unique filename for this frame
-        if num_frames > 1:
-            filename = f"{study_id}/{dicom_path.stem}_frame{frame_idx:04d}"
-        else:
-            filename = f"{study_id}/{dicom_path.stem}"
-
-        # Thumbnail path (relative to project)
-        thumb_name = filename.replace("/", "_") + ".png"
-        thumb_path = output_dir / thumb_name
-
-        # Skip if already processed
-        if thumb_path.exists():
-            results.append({
-                "filename": filename,
-                "study_id": study_id,
-                "thumbnail_path": str(thumb_path),
-                "frame_number": frame_idx,
-            })
-            continue
-
-        # Create thumbnail
-        if create_thumbnail(dicom_path, thumb_path, frame_idx, IMAGE_SIZE):
-            results.append({
-                "filename": filename,
-                "study_id": study_id,
-                "thumbnail_path": str(thumb_path),
-                "frame_number": frame_idx,
-            })
-
+        logger.warning(f"Cannot read {dcm_path}: {e}")
+        return []
+    
+    results = []
+    for i in range(num_frames):
+        r = _process_frame(dcm_path, study_id, i, num_frames, out_dir)
+        if r: results.append(r)
     return results
 
+def _process_wrapper(item, out_dir):
+    "Wrapper for parallel - unpacks tuple"
+    warnings.simplefilter("ignore")
+    dcm_path, study_id = item
+    return process_dicom(dcm_path, study_id, out_dir)
 
-def preprocess_directory(dicom_dir: Path, output_dir: Path, db_path: Path,
-                         n_jobs: int = NUM_WORKERS) -> int:
-    """Process all DICOMs in directory tree.
+# =============================================================================
+# MAIN PIPELINE
+# =============================================================================
 
-    Args:
-        dicom_dir: Root directory containing DICOM files
-        output_dir: Directory for output thumbnails
-        db_path: Path to SQLite database
-        n_jobs: Number of parallel workers
-
-    Returns:
-        Number of images processed
-    """
+def preprocess(dicom_dir, output_dir, db_path, n_workers=NUM_WORKERS):
+    "Process all DICOMs in directory tree"
     ensure_dirs()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Collect all DICOM files
-    print(f"Scanning {dicom_dir} for DICOM files...")
-    dicom_files = list(find_dicoms(dicom_dir))
-    print(f"Found {len(dicom_files)} DICOM files")
+    # Discovery
+    t_discover = Timer("Discover")
+    print(f"Scanning {dicom_dir} for DICOMs files...")
+    dicoms = find_dicoms(dicom_dir)
+    t_discover.add(len(dicoms))
+    
+    if not dicoms: print("No DICOMs found. Exiting."); return 0
 
-    if not dicom_files:
-        print("No DICOM files found. Exiting.")
-        return 0
+    # process in parallel with progress bar
+    t_process = Timer("Processing")
+    print(f"\nProcessing with {n_workers} workers...")
 
-    # Process in parallel
-    print(f"Processing with {n_jobs} workers...")
-
-    results = Parallel(n_jobs=n_jobs, verbose=10)(
-        delayed(process_single_dicom)(dcm_path, study_id, output_dir, db_path)
-        for dcm_path, study_id in dicom_files
-    )
-
+    # fastcore.parallel with progress=True gives us a progress bar
+    results = parallel(partial(_process_wrapper, out_dir=output_dir),
+        dicoms, n_workers=n_workers, progress=True, threadpool=False) # Uses processes for CPU-bound DICOM work
+    
     # Flatten results
-    all_frames = [frame for file_frames in results for frame in file_frames]
-    print(f"Processed {len(all_frames)} total frames")
+    all_frames = L(results).concat()
+    t_process.add(len(all_frames))
+    print(f"    {t_process}")
 
-    # Insert into database
-    print("Updating database...")
+    # Database insertion
+    t_db = Timer("DB Insert")
+    print(f"\nUpdating database....")
     db = get_db(db_path)
 
     inserted = 0
-    for frame in tqdm(all_frames, desc="Inserting to DB"):
+    for frame in progress_bar(all_frames, leave=False):
         if not image_exists(db, frame["filename"]):
-            insert_image(
-                db,
-                filename=frame["filename"],
-                study_id=frame["study_id"],
-                thumbnail_path=frame["thumbnail_path"],
-                frame_number=frame["frame_number"],
-            )
+            insert_image(db, frame["filename"], frame["study_id"], 
+                frame["thumbnail_path"], frame["frame_number"])
             inserted += 1
-        else:
-            logger.warning("Skipping duplicate image: %s", frame["filename"])
+    t_db.add(inserted)
 
-    print(f"Inserted {inserted} new records into database")
-    print(f"Total images in database: {db['labels'].count}")
-    assign_holdout_splits(db)
-
+    print(f"  {t_db}")
+    print(f"  Total in database: {db['labels'].count:,}")
+    
+    # Summary
+    print(f"\n{'='*50}")
+    print("SUMMARY")
+    print(f"{'='*50}")
+    print(f"  {t_discover}")
+    print(f"  {t_process}")
+    print(f"  {t_db}")
+    print(f"{'='*50}")
+    
     return len(all_frames)
 
+# =============================================================================
+# CLI
+# =============================================================================
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Preprocess DICOM files to thumbnails"
-    )
-    parser.add_argument(
-        "--dicom-dir", type=Path, default=DICOM_DIR,
-        help=f"Directory containing DICOM files (default: {DICOM_DIR})"
-    )
-    parser.add_argument(
-        "--output-dir", type=Path, default=THUMBNAIL_DIR,
-        help=f"Output directory for thumbnails (default: {THUMBNAIL_DIR})"
-    )
-    parser.add_argument(
-        "--db", type=Path, default=DB_PATH,
-        help=f"SQLite database path (default: {DB_PATH})"
-    )
-    parser.add_argument(
-        "--workers", type=int, default=NUM_WORKERS,
-        help=f"Number of parallel workers (default: {NUM_WORKERS})"
-    )
-    parser.add_argument(
-        "--test", action="store_true",
-        help=f"Use test directory ({TEST_DICOM_DIR}) instead"
-    )
-
-    args = parser.parse_args()
-
-    dicom_dir = TEST_DICOM_DIR if args.test else args.dicom_dir
-
+# This is a decorator that turns a regular Python function into a CLI script automatically. It reads your function's
+# 1) parameter names -> become CLI arg names 2) Type annotations -> become argument types 3) Default values -> determine if args is required or optional
+# 4) Comments after params -> become --help text
+# This elminates ~20 ines of argparse boilerplate by introspecting your function signature
+@call_parse
+def main(
+    dicom_dir:Path=DICOM_DIR,   # Directory containing DICOM files
+    output_dir:Path=THUMBNAIL_DIR, # Output directory for thumbnails
+    db:Path=DB_PATH,            # SQLite database path
+    workers:int=NUM_WORKERS,    # Number of parallel workers
+    test:bool_arg=False         # Use test directory instead
+):
+    "Preprocess DICOM files to thumbnails"
+    dicom_dir = TEST_DICOM_DIR if test else dicom_dir
+    
     if not dicom_dir.exists():
         print(f"Error: DICOM directory does not exist: {dicom_dir}")
         print("Please create the directory and add DICOM files.")
         sys.exit(1)
-
-    count = preprocess_directory(
+    
+    count = preprocess(
         dicom_dir=dicom_dir,
-        output_dir=args.output_dir,
-        db_path=args.db,
-        n_jobs=args.workers,
+        output_dir=output_dir,
+        db_path=db,
+        n_workers=workers,
     )
-
-    print(f"\nPreprocessing complete. {count} frames ready for labeling.")
+    
+    print(f"\nPreprocessing complete. {count:,} frames ready for labeling.")
     print(f"Run: python scripts/02_label_server.py")
-
-
-if __name__ == "__main__":
-    main()
