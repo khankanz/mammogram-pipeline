@@ -36,28 +36,10 @@ def _split_for(filename):
     "Train/val assignment via hash. Prefix ensures different roll than hold-out selection."
     return "val" if _hash_frac(f"trainval:{filename}") < VALID_PCT else "train"
 
-# Hold-out assignment: bottom HOLDOUT_PCT by hash -> split="test", rest stay NULL
-# This fxn looks at ALL unlabelled, unassigned images and picks 10% for hold-out
-# the end result is that THAT subset of images now haev a 'test' split label assigned to them
-# ALL remainders remain unassigned and have a NULL value for split
-def _assign_holdout(db):
-    "Mark bottom HOLDOUT_PCT of fresh images as test. Deterministic via hash."
-    rows = list(db["labels"].rows_where(
-        "split IS NULL AND has_biopsy_tool IS NULL AND has_mag_view IS NULL"))
-    if not rows: return 0
-    
-    n = int(round(len(rows) * HOLDOUT_PCT))
-    if n <= 0: return 0
-    
-    ranked = sorted(rows, key=lambda r: (_hash_frac(r["filename"]), r["filename"]))
-    for r in ranked[:n]: db["labels"].update(r["id"], {"split": "test"})
-    logger.info(f"Assigned {n} images to hold-out")
-    return n
-
-# This function asks wait, is this already part of hold-out? Don't touch. Has it already been assigned to train or val? Don't change
-# IF neither; assign it now, send it to our hashing function; which basically flips a coin val or train?. Why? 
-    # Walk with me: there are two hash functions; 1st hash: hold-out selection; this ranks ALL images by their hash; bottom 10% = hold-out
-    # 2nd hash: train/val split; note that trainval prefix, meaning this file getsa  DIFFERENT has valuefor this decision
+# Assigns train/val split on first label. Two hash decisions happen at different times:
+#   1st hash (at insert_image): hold-out selection - per-image check if hash < HOLDOUT_PCT → "test"
+#   2nd hash (here): train/val split - uses "trainval:" prefix for independent coin flip
+# Both hashes are deterministic per filename, but prefixes ensure different outcomes.
 def _ensure_split(db, image_id):
     "Assign train/val on first label. Hold-out and existing splits untouched."
     row = db["labels"].get(image_id)
@@ -132,21 +114,23 @@ def get_db(path=None):
 # │  /DELETE/etc)                                               │
 # └─────────────────────────────────────────────────────────────┘
     _init_db(db)
-    _assign_holdout(db)
     return db
 
 # image enters the database ; essentially all NULL values
 def insert_image(db, filename, study_id, thumbnail_path, frame_number=0):
     "Insert new image record. Skips duplicates."
     if image_exists(db, filename): logger.warning(f"Duplicate skipped: {filename}"); return
+
+    # Holdout decision is per-image, based on hash
+    split = "test" if _hash_frac(filename) < HOLDOUT_PCT else None
+
     db["labels"].insert({
         "filename": filename, "study_id": study_id, "thumbnail_path": thumbnail_path,
         "frame_number": frame_number, "has_biopsy_tool": None, "has_mag_view": None,
         "labeled_at": None, "confidence_biopsy": None, "confidence_mag": None,
-        "predicted_at": None, "split": None,
+        "predicted_at": None, "split": split,
     }, ignore=True)
     logger.info(f"Inserted {filename}")
-    _assign_holdout(db) # Evaluate new image for hold-out immediately
 
 def get_unlabeled(db, limit=1, exploration_rate=EXPLORATION_RATE, rng=None):
     "Active learning: balance uncertain, confident, and random samples"
