@@ -177,7 +177,7 @@ def get_labeled(db, split=None):
     if split and split not in ("train", "val", "test"): raise ValueError(f"Invalid split: {split}")
 
     base = "has_biopsy_tool IS NOT NULL AND has_mag_view IS NOT NULL"
-    if split: rows = list(db["label"].rows_where(f"{base} AND split = ?", [split]))
+    if split: rows = list(db["labels"].rows_where(f"{base} AND split = ?", [split]))
     else:     rows = list(db["labels"].rows_where(f"{base} AND split IN ('train', 'val')"))
 
     if split != "test": _no_holdout(rows)
