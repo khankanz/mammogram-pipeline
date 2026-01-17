@@ -4,6 +4,8 @@ models/
 test/
 samp_ds/
 
+results.*
+
 
 # Python
 __pycache__/
