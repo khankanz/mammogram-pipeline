@@ -422,7 +422,7 @@ def main(
     output:Path=Path("results.csv"),         # Study-level CSV export (derived from db)
     model:Path=MODEL_DIR/"model.onnx",       # ONNX model path
     batch_size:int=BATCH_SIZE,               # Batch size for inference
-    threshold:float=0.75,                     # Classification threshold
+    threshold:float=0.5,                     # Classification threshold
     test:bool_arg=False,                     # Use test directory
     resume:bool_arg=False,                   # Resume interrupted job
 ):

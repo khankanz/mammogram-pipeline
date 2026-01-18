@@ -5,7 +5,7 @@ test/
 samp_ds/
 
 results.*
-
+00_benchmark.py
 
 # Python
 __pycache__/
