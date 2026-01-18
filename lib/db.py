@@ -143,8 +143,7 @@ def insert_image(db, filename, study_id, thumbnail_path, frame_number=0):
 def get_unlabeled(db, limit=1, exploration_rate=EXPLORATION_RATE, rng=None):
     "Active learning: balance uncertain, confident, and random samples"
     rng = rng or random
-    where = ("has_biopsy_tool IS NULL AND has_mag_view IS NULL "
-        "AND (split IS NULL OR split IN ('train', 'val'))")
+    where = ("has_biopsy_tool IS NULL AND has_mag_view IS NULL")
     
     # DEBUG
     count = db.execute(f"SELECT COUNT(*) FROM labels WHERE {where}").fetchone()[0]
